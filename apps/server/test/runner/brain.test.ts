@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
-import { INLINE_CODE_DENY_RULES, PUSH_ASK_RULES } from "@agenteschat/adapters/command-policy";
+import { forbiddenReason, INLINE_CODE_DENY_RULES, PUSH_ASK_RULES } from "@agenteschat/adapters/command-policy";
 import {
   BRAIN_PROFILES_PROTOCOL,
   BRAIN_PROTOCOL,
@@ -62,7 +62,14 @@ import {
 import { CLAUDE_SILENCE, silenceLimit } from "../../runner/brain-silence";
 import { claudeAuth } from "../../runner/executors";
 import { handleRequest } from "../../runner/handlers";
-import { chatToolsBreach, delegatedToolsBreach, type IpcReply, McpBridge, McpToolCache } from "../../runner/mcp";
+import {
+  chatToolsBreach,
+  delegatedToolsBreach,
+  type IpcReply,
+  McpBridge,
+  McpToolCache,
+  mcpScopeFromEnv,
+} from "../../runner/mcp";
 import { agentWorkspace } from "../../runner/paths";
 import { claudeSessionFile } from "../../runner/tasks";
 import { errorCode, removeDirs, tempDir, waitFor } from "./helpers";
@@ -1450,6 +1457,36 @@ test.if(posix)("a turn in one of its checkouts keeps the agent's whole folder (-
   const args = spawns()[0]?.args ?? [];
   expect(args[args.indexOf("--add-dir") + 1]).toBe(folder);
 });
+
+test.if(posix)(
+  "a folder granted to the agent is inside its scope for the command check, not only the sandbox",
+  async () => {
+    const { spawns, turn } = setup();
+    const shared = tempDir("brain-granted-");
+    const elsewhere = tempDir("brain-elsewhere-");
+    dirs.push(shared, elsewhere);
+    const r = await turn(1, "hi", {}, undefined, { grants: [shared] });
+    expect(r.final).toMatchObject({ type: "done" });
+    const args = spawns()[0]?.args ?? [];
+    // The sandbox already took the folder (`--add-dir`); the command check reads the MCP config's scope.
+    expect(args[args.indexOf("--add-dir") + 1]).toBe(shared);
+    const config = JSON.parse(readFileSync(args[args.indexOf("--mcp-config") + 1] as string, "utf8")) as {
+      mcpServers: { agentes: { env: Record<string, string> } };
+    };
+    const scope = mcpScopeFromEnv(config.mcpServers.agentes.env);
+    if (!scope) throw new Error("the turn wrote no MCP scope");
+    expect(scope.folders).toContain(shared);
+    // The issue's repro: a write into the granted folder is inside the mission, and anywhere else is still refused.
+    expect(forbiddenReason("Bash", { command: `mkdir -p ${path.join(shared, "test")}` }, scope)).toBeNull();
+    expect(forbiddenReason("Bash", { command: `mkdir -p ${path.join(elsewhere, "test")}` }, scope)).toContain(
+      "outside the mission folder",
+    );
+    expect(forbiddenReason("Edit", { file_path: path.join(shared, "note.txt") }, scope)).toBeNull();
+    expect(forbiddenReason("Edit", { file_path: path.join(elsewhere, "note.txt") }, scope)).toBe(
+      "it changes files outside the mission folder",
+    );
+  },
+);
 
 test.if(posix)(
   "a chat turn starts in the agent's own folder, reads none of it and may only call our tools",
